@@ -1,0 +1,441 @@
+---
+title: "código_TFM_RubioLagunas_Silvia"
+---
+
+# Preparación del entorno y de los datos
+
+```{r}
+# Reproducibilidad y librerías
+seed <- 12345; set.seed(seed)
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(tibble)
+  library(caret); library(pROC); library(randomForest)
+  library(ROSE); library(smotefamily); library(xgboost)
+  library(DBI); library(RSQLite)
+})
+
+# Carga del dataset
+stroke_data <- read.csv("/home/katutxu/Descargas/stroke.csv")
+
+# Limpieza de BMI
+stroke_data$bmi[stroke_data$bmi == "N/A"] <- NA
+stroke_data$bmi <- as.numeric(stroke_data$bmi)
+stroke_data$bmi[is.na(stroke_data$bmi)] <- median(stroke_data$bmi, na.rm = TRUE)
+
+# Agrupar categorías poco frecuentes en work_type
+stroke_data <- stroke_data %>%
+  mutate(work_type_grouped = ifelse(work_type %in% c("children","Never_worked"),
+                                    "No/little work", as.character(work_type))) %>%
+  mutate(across(c(gender, ever_married, work_type_grouped, Residence_type,
+                  smoking_status, hypertension, heart_disease, stroke), as.factor))
+
+# Eliminar columnas no usadas si existen
+cols_to_remove <- intersect(c("id","work_type"), names(stroke_data))
+stroke_data <- dplyr::select(stroke_data, -all_of(cols_to_remove))
+
+# Partición estratificada 70/30
+idx <- caret::createDataPartition(stroke_data$stroke, p = 0.7, list = FALSE)
+train_data <- stroke_data[idx, ]
+test_data  <- stroke_data[-idx, ]
+
+```
+
+```{r}
+cm_metrics <- function(pred, ref){
+  cm <- caret::confusionMatrix(pred, ref, positive = "1")
+  c(Accuracy    = unname(cm$overall["Accuracy"]),
+    Sensitivity = unname(cm$byClass["Sensitivity"]),
+    Specificity = unname(cm$byClass["Specificity"]),
+    F1          = unname(cm$byClass["F1"]))
+}
+
+tune_threshold <- function(probs, ref, by = 0.01, optimize = c("F1","Sensitivity")){
+  optimize <- match.arg(optimize)
+  th <- seq(0, 1, by = by)
+  scores <- sapply(th, function(t){
+    pred <- factor(ifelse(probs > t, "1", "0"), levels = c("0","1"))
+    cm <- caret::confusionMatrix(pred, ref, positive = "1")
+    cm$byClass[optimize]
+  })
+  list(threshold = th[which.max(scores)], score = max(scores))
+}
+
+add_auc <- function(p, r) as.numeric(pROC::auc(r, p))
+
+collect_row <- function(name, os, note, probs, ref, thr){
+  pred <- factor(ifelse(probs > thr, "1", "0"), levels = c("0","1"))
+  m <- cm_metrics(pred, ref)
+  tibble::tibble(
+    Modelo = name, Oversampling = os, Umbral = note, Threshold = thr,
+    Accuracy = as.numeric(m["Accuracy"]),
+    Sensitivity = as.numeric(m["Sensitivity"]),
+    Specificity = as.numeric(m["Specificity"]),
+    F1 = as.numeric(m["F1"]),
+    AUC = add_auc(probs, ref),
+    BalancedAccuracy = (as.numeric(m["Sensitivity"]) + as.numeric(m["Specificity"])) / 2
+  )
+}
+
+```
+
+# Modelado baseline y comparación inicial
+
+```{r}
+# Random Forest (baseline)
+rf_base <- randomForest(stroke ~ ., data = train_data, ntree = 500, importance = TRUE)
+rf_base_probs <- predict(rf_base, newdata = test_data, type = "prob")[, "1"]
+best_rf_base  <- tune_threshold(rf_base_probs, test_data$stroke, optimize = "F1")
+res_rf_base   <- collect_row("Random Forest", "No", "F1-opt",
+                             rf_base_probs, test_data$stroke, best_rf_base$threshold)
+
+# RF + ROSE (oversampling solo en train)
+train_rose <- ROSE(stroke ~ ., data = train_data, seed = seed)$data
+rf_rose <- randomForest(stroke ~ ., data = train_rose, ntree = 500, importance = TRUE)
+rf_rose_probs <- predict(rf_rose, newdata = test_data, type = "prob")[, "1"]
+best_rf_rose  <- tune_threshold(rf_rose_probs, test_data$stroke, optimize = "F1")
+res_rf_rose   <- collect_row("Random Forest", "ROSE (train)", "F1-opt",
+                             rf_rose_probs, test_data$stroke, best_rf_rose$threshold)
+
+# RF + SMOTE (smotefamily) — codificación coherente
+train_num <- train_data %>%
+  mutate(across(everything(), ~ if (is.factor(.x)) as.numeric(.x) else .x))
+X_train <- dplyr::select(train_num, -stroke)
+y_train <- train_num$stroke
+
+sm_out <- smotefamily::SMOTE(X = X_train, target = y_train, K = 5)
+sm_train <- sm_out$data
+names(sm_train)[ncol(sm_train)] <- "stroke"
+sm_train$stroke <- factor(sm_train$stroke, labels = levels(train_data$stroke))
+
+rf_smote <- randomForest(stroke ~ ., data = sm_train, ntree = 500, importance = TRUE)
+
+encode_with_train_levels <- function(df_test, df_train){
+  out <- df_test
+  for (cl in names(df_train)) {
+    if (cl == "stroke") next
+    if (is.factor(df_train[[cl]])) {
+      coded <- as.integer(factor(out[[cl]], levels = levels(df_train[[cl]])))
+      mode_code <- which.max(tabulate(as.integer(df_train[[cl]])))
+      coded[is.na(coded)] <- mode_code
+      out[[cl]] <- coded
+    } else {
+      out[[cl]] <- as.numeric(out[[cl]])
+    }
+  }
+  out
+}
+
+test_num <- encode_with_train_levels(test_data, train_data)
+rf_smote_probs <- predict(rf_smote, newdata = test_num, type = "prob")[, "1"]
+best_rf_smote  <- tune_threshold(rf_smote_probs, test_data$stroke, optimize = "F1")
+res_rf_smote   <- collect_row("Random Forest", "SMOTE (train)", "F1-opt",
+                              rf_smote_probs, test_data$stroke, best_rf_smote$threshold)
+
+# XGBoost (determinista)
+train_x <- model.matrix(stroke ~ . - 1, data = train_data)
+test_x  <- model.matrix(stroke ~ . - 1, data = test_data)
+train_y <- as.numeric(train_data$stroke) - 1
+test_y  <- as.numeric(test_data$stroke) - 1
+
+dtrain <- xgb.DMatrix(train_x, label = train_y)
+dtest  <- xgb.DMatrix(test_x,  label = test_y)
+spw <- sum(train_y == 0) / sum(train_y == 1)
+
+params <- list(
+  objective = "binary:logistic", eval_metric = "auc",
+  eta = 0.05, max_depth = 4, min_child_weight = 1,
+  subsample = 1, colsample_bytree = 1,
+  scale_pos_weight = spw, seed = seed
+)
+
+xgb_mod <- xgb.train(params = params, data = dtrain, nrounds = 300,
+                     early_stopping_rounds = 30, watchlist = list(train = dtrain), verbose = 0)
+
+xgb_probs <- predict(xgb_mod, newdata = dtest)
+best_xgb  <- tune_threshold(xgb_probs, test_data$stroke, optimize = "F1")
+res_xgb   <- collect_row("XGBoost", "No", "F1-opt",
+                         xgb_probs, test_data$stroke, best_xgb$threshold)
+
+# Tabla comparativa (ordenada por Balanced Accuracy)
+resumen_modelos <- dplyr::bind_rows(res_rf_base, res_rf_rose, res_rf_smote, res_xgb) %>%
+  mutate(across(c(Accuracy, Sensitivity, Specificity, F1, AUC, BalancedAccuracy), as.numeric)) %>%
+  arrange(desc(BalancedAccuracy))
+
+print(resumen_modelos, row.names = FALSE)
+
+```
+
+# Validación cruzada y contraste DeLong
+
+```{r}
+# Conversión a etiquetas pos/neg para caret
+to_posneg <- function(df){
+  df %>% mutate(stroke = factor(ifelse(stroke == "1","pos","neg"), levels = c("neg","pos")))
+}
+train_cv <- to_posneg(train_data)
+test_cv  <- to_posneg(test_data)
+
+# summaryFunction robusta para caret
+f1_summary <- function(data, lev = NULL, model = NULL) {
+  pos <- lev[2]
+  prob_col <- make.names(pos)
+  cm <- caret::confusionMatrix(data$pred, data$obs, positive = pos)
+  sens <- cm$byClass["Sensitivity"]; spec <- cm$byClass["Specificity"]
+  f1   <- cm$byClass["F1"]; acc <- cm$overall["Accuracy"]
+  aucv <- if (prob_col %in% colnames(data)) as.numeric(pROC::auc(data$obs, data[[prob_col]])) else NA_real_
+  c(ROC = aucv, Sensitivity = sens, Specificity = spec, F1 = f1, Accuracy = acc)
+}
+
+ctrl_cv <- trainControl(
+  method = "repeatedcv", number = 5, repeats = 3,
+  classProbs = TRUE, summaryFunction = f1_summary,
+  savePredictions = "final", sampling = "up"
+)
+
+# RF con tuning (mtry)
+grid_rf <- expand.grid(mtry = c(2,3,4,5,6))
+rf_cv <- caret::train(
+  stroke ~ ., data = train_cv, method = "rf",
+  metric = "F1", tuneGrid = grid_rf, trControl = ctrl_cv,
+  ntree = 1000, importance = TRUE
+)
+
+# XGB con tuning (xgbTree)
+grid_xgb <- expand.grid(
+  nrounds = c(200, 300, 400),
+  max_depth = c(3, 4, 5),
+  eta = c(0.03, 0.05, 0.1),
+  gamma = c(0, 1),
+  colsample_bytree = c(0.8, 1.0),
+  min_child_weight = c(1, 3),
+  subsample = c(0.8, 1.0)
+)
+spw <- sum(train_cv$stroke == "neg") / sum(train_cv$stroke == "pos")
+xgb_cv <- caret::train(
+  stroke ~ ., data = train_cv, method = "xgbTree",
+  metric = "F1", tuneGrid = grid_xgb, trControl = ctrl_cv,
+  scale_pos_weight = spw, verbose = FALSE
+)
+
+# Probabilidades y umbral óptimo F1 en test (pos/neg)
+rf_probs_cv  <- predict(rf_cv,  newdata = test_cv, type = "prob")[, "pos"]
+xgb_probs_cv <- predict(xgb_cv, newdata = test_cv, type = "prob")[, "pos"]
+
+best_thr <- function(probs, y){
+  th <- seq(0,1,0.01)
+  f1 <- sapply(th, function(t){
+    pr <- factor(ifelse(probs > t, "pos", "neg"), levels = c("neg","pos"))
+    caret::confusionMatrix(pr, y, positive = "pos")$byClass["F1"]
+  })
+  th[which.max(f1)]
+}
+thr_rf_best  <- best_thr(rf_probs_cv,  test_cv$stroke)
+thr_xgb_best <- best_thr(xgb_probs_cv, test_cv$stroke)
+
+pred_rf_best  <- factor(ifelse(rf_probs_cv > thr_rf_best,  "pos", "neg"), levels = c("neg","pos"))
+pred_xgb_best <- factor(ifelse(xgb_probs_cv > thr_xgb_best, "pos", "neg"), levels = c("neg","pos"))
+
+cm_rf_best   <- caret::confusionMatrix(pred_rf_best,  test_cv$stroke, positive = "pos")
+cm_xgb_best  <- caret::confusionMatrix(pred_xgb_best, test_cv$stroke, positive = "pos")
+auc_rf_best  <- as.numeric(pROC::auc(test_cv$stroke, rf_probs_cv))
+auc_xgb_best <- as.numeric(pROC::auc(test_cv$stroke, xgb_probs_cv))
+
+# Curvas ROC y test de DeLong en test
+roc_rf  <- pROC::roc(response = test_cv$stroke, predictor = rf_probs_cv,  levels = c("neg","pos"), direction = "<")
+roc_xgb <- pROC::roc(response = test_cv$stroke, predictor = xgb_probs_cv, levels = c("neg","pos"), direction = "<")
+
+auc(roc_rf);  ci.auc(roc_rf)
+auc(roc_xgb); ci.auc(roc_xgb)
+
+pROC::roc.test(roc_rf, roc_xgb, method = "delong", paired = TRUE)
+
+```
+
+# SQLite y vistas para Power BI
+
+```{r}
+run_id <- format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z")
+created_at <- run_id
+
+con <- DBI::dbConnect(RSQLite::SQLite(), "stroke_results_v2.sqlite")
+DBI::dbExecute(con, "PRAGMA journal_mode=WAL;")
+
+DBI::dbExecute(con, "
+CREATE TABLE IF NOT EXISTS predicciones (
+  run_id TEXT, created_at TEXT,
+  modelo TEXT, id_row INTEGER, prob REAL, pred TEXT, truth TEXT,
+  threshold REAL, fold TEXT, split TEXT
+);
+")
+DBI::dbExecute(con, "
+CREATE TABLE IF NOT EXISTS metricas (
+  run_id TEXT, created_at TEXT,
+  modelo TEXT, split TEXT, metric TEXT, value REAL, fold TEXT, cv_stage TEXT
+);
+")
+DBI::dbExecute(con, "
+CREATE TABLE IF NOT EXISTS umbrales (
+  run_id TEXT, created_at TEXT,
+  modelo TEXT, criterio TEXT, threshold REAL, split TEXT
+);
+")
+DBI::dbExecute(con, "
+CREATE TABLE IF NOT EXISTS importancias (
+  run_id TEXT, created_at TEXT,
+  modelo TEXT, feature TEXT, gain REAL, cover REAL, frequency REAL, source TEXT
+);
+")
+DBI::dbExecute(con, "
+CREATE TABLE IF NOT EXISTS cv_nested (
+  run_id TEXT, created_at TEXT,
+  modelo TEXT, fold INTEGER, auc REAL, f1 REAL, sens REAL, spec REAL, ba REAL
+);
+")
+
+write_predictions_generic <- function(con, modelo, probs, truth, threshold,
+                                      split_label = "test", fold = NA_character_,
+                                      pos_label = "pos", neg_label = "neg") {
+  df <- tibble(
+    run_id = run_id, created_at = created_at, modelo = modelo,
+    id_row = seq_along(probs), prob = as.numeric(probs),
+    pred = ifelse(probs > threshold, pos_label, neg_label),
+    truth = as.character(truth), threshold = threshold,
+    fold = fold, split = split_label
+  )
+  DBI::dbWriteTable(con, "predicciones", df, append = TRUE)
+}
+
+write_metrics_generic <- function(con, modelo, probs, truth, threshold,
+                                  split_label = "test", fold = NA_character_,
+                                  pos_label = "pos", neg_label = "neg",
+                                  cv_stage = "test") {
+  pred <- factor(ifelse(probs > threshold, pos_label, neg_label), levels = c(neg_label, pos_label))
+  ref  <- factor(as.character(truth), levels = c(neg_label, pos_label))
+  cm <- caret::confusionMatrix(pred, ref, positive = pos_label)
+  vals <- c(
+    Accuracy    = unname(cm$overall["Accuracy"]),
+    Sensitivity = unname(cm$byClass["Sensitivity"]),
+    Specificity = unname(cm$byClass["Specificity"]),
+    F1          = unname(cm$byClass["F1"])
+  )
+  auc_val <- tryCatch(as.numeric(pROC::auc(ref, as.numeric(probs))), error = function(e) NA_real_)
+  vals <- c(vals, AUC = auc_val, BalancedAccuracy = mean(c(vals["Sensitivity"], vals["Specificity"])))
+  df <- tibble(
+    run_id = run_id, created_at = created_at, modelo = modelo,
+    split = split_label, metric = names(vals), value = as.numeric(vals),
+    fold = fold, cv_stage = cv_stage
+  )
+  DBI::dbWriteTable(con, "metricas", df, append = TRUE)
+
+  DBI::dbWriteTable(con, "umbrales",
+    tibble(run_id = run_id, created_at = created_at, modelo = modelo,
+           criterio = "F1-opt", threshold = threshold, split = split_label),
+    append = TRUE)
+}
+
+write_importance_rf <- function(con, rf_model, modelo) {
+  imp <- randomForest::importance(rf_model)
+  imp_df <- as.data.frame(imp); imp_df$feature <- rownames(imp_df)
+  gini  <- if ("MeanDecreaseGini" %in% names(imp_df)) imp_df$MeanDecreaseGini else NA_real_
+  acc   <- if ("MeanDecreaseAccuracy" %in% names(imp_df)) imp_df$MeanDecreaseAccuracy else NA_real_
+  df <- tibble(
+    run_id = run_id, created_at = created_at, modelo = modelo,
+    feature = imp_df$feature, gain = acc, cover = NA_real_, frequency = gini,
+    source = "rf_importance"
+  )
+  DBI::dbWriteTable(con, "importancias", df, append = TRUE)
+}
+
+write_importance_xgb <- function(con, booster, modelo) {
+  imp <- xgboost::xgb.importance(model = booster)  # Gain/Cover/Frequency por defecto
+  if (NROW(imp) == 0) return(invisible(NULL))
+  df <- tibble(
+    run_id = run_id, created_at = created_at, modelo = modelo,
+    feature = imp$Feature, gain = imp$Gain, cover = imp$Cover, frequency = imp$Frequency,
+    source = "xgb_importance"
+  )
+  DBI::dbWriteTable(con, "importancias", df, append = TRUE)
+}
+
+# Guardar modelos CV tuned (pos/neg)
+write_predictions_generic(con, "Random Forest (CV tuned)",
+                          rf_probs_cv, test_cv$stroke, thr_rf_best,
+                          split_label = "test", pos_label = "pos", neg_label = "neg")
+write_metrics_generic(con, "Random Forest (CV tuned)",
+                      rf_probs_cv, test_cv$stroke, thr_rf_best,
+                      split_label = "test", pos_label = "pos", neg_label = "neg", cv_stage = "test")
+write_importance_rf(con, rf_cv$finalModel, "Random Forest (CV tuned)")
+
+write_predictions_generic(con, "XGBoost (CV tuned)",
+                          xgb_probs_cv, test_cv$stroke, thr_xgb_best,
+                          split_label = "test", pos_label = "pos", neg_label = "neg")
+write_metrics_generic(con, "XGBoost (CV tuned)",
+                      xgb_probs_cv, test_cv$stroke, thr_xgb_best,
+                      split_label = "test", pos_label = "pos", neg_label = "neg", cv_stage = "test")
+write_importance_xgb(con, xgb_cv$finalModel, "XGBoost (CV tuned)")
+
+# Guardar modelos baseline (0/1)
+write_predictions_generic(con, "Random Forest (baseline)",
+                          rf_base_probs, test_data$stroke, best_rf_base$threshold,
+                          split_label = "test", pos_label = "1", neg_label = "0")
+write_metrics_generic(con, "Random Forest (baseline)",
+                      rf_base_probs, test_data$stroke, best_rf_base$threshold,
+                      split_label = "test", pos_label = "1", neg_label = "0", cv_stage = "test")
+write_importance_rf(con, rf_base, "Random Forest (baseline)")
+
+write_predictions_generic(con, "Random Forest (ROSE train)",
+                          rf_rose_probs, test_data$stroke, best_rf_rose$threshold,
+                          split_label = "test", pos_label = "1", neg_label = "0")
+write_metrics_generic(con, "Random Forest (ROSE train)",
+                      rf_rose_probs, test_data$stroke, best_rf_rose$threshold,
+                      split_label = "test", pos_label = "1", neg_label = "0", cv_stage = "test")
+write_importance_rf(con, rf_rose, "Random Forest (ROSE train)")
+
+write_predictions_generic(con, "Random Forest (SMOTE train)",
+                          rf_smote_probs, test_data$stroke, best_rf_smote$threshold,
+                          split_label = "test", pos_label = "1", neg_label = "0")
+write_metrics_generic(con, "Random Forest (SMOTE train)",
+                      rf_smote_probs, test_data$stroke, best_rf_smote$threshold,
+                      split_label = "test", pos_label = "1", neg_label = "0", cv_stage = "test")
+write_importance_rf(con, rf_smote, "Random Forest (SMOTE train)")
+
+write_predictions_generic(con, "XGBoost (determinista)",
+                          xgb_probs, test_data$stroke, best_xgb$threshold,
+                          split_label = "test", pos_label = "1", neg_label = "0")
+write_metrics_generic(con, "XGBoost (determinista)",
+                      xgb_probs, test_data$stroke, best_xgb$threshold,
+                      split_label = "test", pos_label = "1", neg_label = "0", cv_stage = "test")
+write_importance_xgb(con, xgb_mod, "XGBoost (determinista)")
+
+# Vistas para Power BI
+DBI::dbExecute(con, "
+CREATE VIEW IF NOT EXISTS last_run AS
+SELECT created_at
+FROM metricas
+ORDER BY created_at DESC
+LIMIT 1;
+")
+DBI::dbExecute(con, "
+CREATE VIEW IF NOT EXISTS metricas_latest AS
+SELECT m.*
+FROM metricas m
+JOIN last_run lr ON m.created_at = lr.created_at;
+")
+DBI::dbExecute(con, "
+CREATE VIEW IF NOT EXISTS metricas_latest_wide AS
+SELECT
+  modelo, split,
+  MAX(CASE WHEN metric='Accuracy'         THEN value END) AS Accuracy,
+  MAX(CASE WHEN metric='Sensitivity'      THEN value END) AS Sensitivity,
+  MAX(CASE WHEN metric='Specificity'      THEN value END) AS Specificity,
+  MAX(CASE WHEN metric='F1'               THEN value END) AS F1,
+  MAX(CASE WHEN metric='AUC'              THEN value END) AS AUC,
+  MAX(CASE WHEN metric='BalancedAccuracy' THEN value END) AS BalancedAccuracy
+FROM metricas_latest
+GROUP BY modelo, split;
+")
+
+DBI::dbDisconnect(con)
+message('✅ Resultados guardados en stroke_results_v2.sqlite con run_id = ', run_id)
+
+```
